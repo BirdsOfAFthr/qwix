@@ -15,6 +15,7 @@
 
 from collections.abc import Callable, Collection, Sequence
 import dataclasses
+import functools
 import re
 from typing import Any
 
@@ -104,14 +105,18 @@ class QuantizationProvider:
   injected into the model by using interception.py.
   """
 
-  def __init__(self, rules: Sequence[QuantizationRule]):
+  def __init__(
+      self, rules: Sequence[QuantizationRule], *, disable_jit: bool = False
+  ):
     """Initialize the provider.
 
     Args:
       rules: The quantization rules in the order of precedence.
+      disable_jit: Whether to disable JIT when wrapping methods.
     """
     self._rules = [self._init_rule(rule) for rule in rules]
     self._logged_ops = set()
+    self.disable_jit = disable_jit
 
   def _init_rule(self, rule: QuantizationRule) -> QuantizationRule:
     """Validate and set default values for the rule."""
@@ -123,9 +128,9 @@ class QuantizationProvider:
       rule = dataclasses.replace(rule, act_calibration_method='absmax')
     return rule
 
-  def get_intercept_map(self) -> dict[str, Callable[..., Any]]:
-    """Returns the intercept map for interception.wrap_func_intercepted."""
-    # Common functions that are intercepted by all quantization providers.
+  @functools.cached_property
+  def _default_intercept_map(self) -> dict[str, Callable[..., Any]]:
+    """Returns the default intercept map."""
     intercept_map = {
         'qwix._src.qconfig.get_current_rule': (
             lambda op: self._get_current_rule_and_op_id(op, only_rule=True)[0]
@@ -139,6 +144,10 @@ class QuantizationProvider:
           )
       )
     return intercept_map
+
+  def get_intercept_map(self) -> dict[str, Callable[..., Any]]:
+    """Returns the intercept map for interception.wrap_func_intercepted."""
+    return self._default_intercept_map
 
   def get_interceptors(
       self,

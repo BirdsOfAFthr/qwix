@@ -13,6 +13,7 @@
 # limitations under the License.
 """Intercepts Python functions by patching."""
 
+import contextlib
 import functools
 import sys
 import threading
@@ -32,15 +33,49 @@ Interceptor: TypeAlias = Mapping[str, Function]
 PRIMITIVE_BIND_KEY = "jax._src.core.Primitive.bind"
 
 
+def _preprocess_interceptor(
+    interceptor_dict: Interceptor, disable_jit: bool
+) -> tuple[dict[str, Function], int]:
+  """Preprocesses the interceptor and computes its stable ID."""
+  interceptor = dict(interceptor_dict)
+  # Preprocess the interceptor for JAX-specific and alias-aware rewrites.
+  for name in list(interceptor):
+    # Resolve path to the actual object (e.g., PjitFunction or FunctionType).
+    original_fn = get_attribute(name)
+
+    # 1. Handle PjitFunction objects conditionally based on JIT state.
+    if disable_jit and isinstance(
+        original_fn,
+        jax._src.lib._jax.PjitFunction,  # pylint: disable=protected-access
+    ):
+      fn_name = name + "._fun"
+      interceptor[fn_name] = interceptor.pop(name)
+      name = fn_name
+      original_fn = original_fn._fun  # pylint: disable=protected-access
+
+    # 2. Rewrite Functions to code objects to target the bytecode.
+    if (
+        isinstance(original_fn, types.FunctionType)
+        and not original_fn.__code__.co_freevars
+    ):
+      interceptor[name + ".__code__"] = interceptor.pop(name)
+
+  # Stabilize the interceptor hash by tuple sorting its map.
+  # Include disable_jit in the hash because the installed hooks differ.
+  interceptor_id = hash((tuple(sorted(interceptor.items())), disable_jit))
+  return interceptor, interceptor_id
+
+
 def wrap_func_intercepted(
     func: Function,
     get_interceptor: Callable[[], Interceptor],
     *,
+    disable_jit: bool,
     input_transform: Callable[[Any, Any], tuple[Any, Any]] = lambda *x: x,
     output_transform: Callable[[Any], Any] = lambda x: x,
     should_intercept: Callable[[], bool] = lambda: True,
 ) -> Function:
-  """Wrap a function in a scope where functions in intercept_map are intercepted.
+  """Wrap a function in an interception scope.
 
   We're doing a little bit more than just monkey-patching the attributes of the
   objects, including
@@ -76,6 +111,7 @@ def wrap_func_intercepted(
     func: The function to wrap.
     get_interceptor: A function that returns a mapping from function names to
       functions, e.g. {"jax.lax.dot_general": quantized_dot_general}.
+    disable_jit: Whether to disable JIT when calling the wrapped function.
     input_transform: A function to transform the input (args and kwargs) of the
       function.
     output_transform: A function to transform the output of the function.
@@ -86,66 +122,28 @@ def wrap_func_intercepted(
     A wrapped function.
   """
 
+  interceptor, interceptor_id = _preprocess_interceptor(
+      get_interceptor(), disable_jit
+  )
+
   @functools.wraps(func)
   def wrapper(*args, **kwargs):
-    # In Python, the id of an instance will change every time! i.e.
-    # id(obj.method) != id(obj.method).
-    interceptor_id = hash(get_interceptor)
-
     if interception_manager.is_active(interceptor_id) or not should_intercept():
       return func(*args, **kwargs)
-
-    # Whether to disable JIT. This is needed if we patch any PjitFunction
-    # objects.
-    need_to_disable_jit = False
-
-    interceptor = dict(get_interceptor())
-    # Preprocess the interceptor for JAX-specific and alias-aware rewrites.
-    for name in list(interceptor):
-      # Resolve the path to the actual object (e.g., PjitFunction or
-      # FunctionType).
-      # {name: handler}
-      original_fn = get_attribute(name)
-
-      # 1. Handle PjitFunction objects: unwrap function and reach the source
-      # code.
-      # {name + "._fun": handler}
-      if isinstance(original_fn, jax._src.lib._jax.PjitFunction):  # pylint: disable=protected-access
-        fn_name = name + "._fun"
-        interceptor[fn_name] = interceptor.pop(name)
-        need_to_disable_jit = True
-        name = fn_name
-        original_fn = original_fn._fun  # pylint: disable=protected-access
-
-      # 2. Rewrite Functions to code objects to target the bytecode.
-      # This ensures that all aliases of the function (e.g., jnp.sin and
-      # jax.lax.sin) are intercepted since they share the same underlying code
-      # object.
-      # {name + ".__code__": handler}
-      if (
-          isinstance(original_fn, types.FunctionType)
-          and not original_fn.__code__.co_freevars
-      ):
-        interceptor[name + ".__code__"] = interceptor.pop(name)
-
-    # Check if JIT is already disabled.
-    if jax.config.jax_disable_jit:
-      need_to_disable_jit = False
-    elif PRIMITIVE_BIND_KEY in interceptor:
-      # Disable JIT to ensure primitive calls are intercepted.
-      need_to_disable_jit = True
 
     # Apply the input transform.
     args, kwargs = input_transform(args, kwargs)
 
     interception_manager.activate_interceptor(interceptor_id, interceptor)
-    if need_to_disable_jit:
-      jax.config.update("jax_disable_jit", True)
+    context_manager = (
+        jax.disable_jit()
+        if (not jax.config.jax_disable_jit and disable_jit)
+        else contextlib.nullcontext()
+    )
     try:
-      output = func(*args, **kwargs)
+      with context_manager:
+        output = func(*args, **kwargs)
     finally:
-      if need_to_disable_jit:
-        jax.config.update("jax_disable_jit", False)
       interception_manager.deactivate_interceptor(interceptor_id)
 
     # Apply the output transform.
@@ -353,7 +351,7 @@ class _InterceptionManager:
         self._intercepted_threads[(this_thread, interceptor_to_use[0])] = True
 
   def disable_interception(self) -> list[int]:
-    """Disables all interceptions for the current thread and returns the list of disabled interceptors."""
+    """Disables interceptions for thread and returns list of disabled hooks."""
     this_thread = threading.get_ident()
     disabled_interceptor_ids = []
     with self._lock:
@@ -400,7 +398,7 @@ def _fn_to_code(fn: Function) -> types.CodeType:
 
 
 def _copy_fn(fn: types.FunctionType) -> types.FunctionType:
-  """Constructs a new function object with the same attributes as the given one."""
+  """Constructs a new function object copying attributes from the given one."""
   fn_copy = types.FunctionType(fn.__code__, fn.__globals__)
   for field in (
       "__name__",

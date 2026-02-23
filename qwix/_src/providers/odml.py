@@ -64,7 +64,14 @@ class OdmlQatProvider(qconfig.QuantizationProvider):
         outputs, e.g. (0, 1).
       strict: Whether to raise an error if an unknown op is discovered.
     """
-    super().__init__(rules)
+    # For ODML interception, we always disable JIT. This is because ODML relies
+    # on execution at the Python level to:
+    # 1. Patch low-level structural primitives (e.g., Primitive.bind) to
+    #    propagate metadata.
+    # 2. Support bytecode patching and recursive PjitFunction interception.
+    #    JAX's C++ dispatch bypasses the patched Python `__code__` when JIT
+    #    is enabled, preventing us from catching inner function calls.
+    super().__init__(rules, disable_jit=True)
     self._fixed_range_for_inputs = fixed_range_for_inputs
     self._fixed_range_for_outputs = fixed_range_for_outputs
     self._strict = strict
@@ -363,7 +370,7 @@ class OdmlConversionProvider(OdmlQatProvider):
   def _compute_static_scale_zero_point(
       self, how: qarray.HowToQuantize, quant_stat_name: str
   ) -> tuple[jax.Array, jax.Array | None]:
-    """Statically compute the scale and zero point for weights or activations."""
+    """Statically compute the scale and zero point."""
     # Look up the quant_stat for the activation.
     obj = self._quant_stats
     for key in flax_util.get_current_module_path():
